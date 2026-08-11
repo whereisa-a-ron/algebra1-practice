@@ -411,69 +411,172 @@ dl dd{margin:2px 0 0;color:var(--muted)}
   "use strict";
 
   /* ================================================================
-     Content math compiler — ported verbatim from lib/math.js. Same
-     two-phase SYMBOLIC/STRUCTURAL compilation, same command aliases,
-     same $...$ delimiter and \$ escape contract. Do not let this drift
-     from lib/math.js; content authored against that compiler must render
-     identically here.
+     Content math compiler. NOT duplicated here — build/app.mjs splices
+     in the real lib/math.js between the markers below, the same way it
+     inlines lib/rng.js and the generators.
+
+     There used to be a hand-copied port here with a comment reading
+     "do not let this drift from lib/math.js". It drifted: markdown
+     emphasis was added to lib/math.js and the app kept printing literal
+     asterisks, so the PDFs and the app disagreed about the same content.
+     A comment is not a mechanism.
      ================================================================ */
-  const CMD = (name, to) => [new RegExp(`\\\\${name}(?![a-zA-Z])`, "g"), to];
+  // MATH_INLINE_START
+// Math markup → HTML. Same output the prototype's CSS already styles.
+//
+// Compilation is two strictly ordered phases:
+//
+//   1. SYMBOLIC — operator substitution (+-, <=, >=, !=, ASCII hyphen),
+//      run exactly ONCE over the raw source, before any HTML exists.
+//      It must never run again after STRUCTURAL has generated tags:
+//      every structural template ends in a literal `>` (</sup>, </span>),
+//      so a re-run of the >= rule would find that `>` sitting next to a
+//      user's `=` and eat both into a single ≥, corrupting the markup
+//      (`x^2=9` → `x<sup>2</sup>=9` would become `x<sup>2</sup≥9`, silently
+//      dropping the `= 9`). This bit real output — see test/math.test.mjs
+//      for the pinned regression.
+//
+//   2. STRUCTURAL — \frac, \sqrt, ^ — looped to a fixed point, because
+//      \frac{..}{..} and \sqrt{..} are matched with [^{}]*, which cannot
+//      see past a nested brace. A fraction whose numerator contains
+//      \sqrt{..} (or vice versa) fails to match on the pass where the
+//      outer command is examined, because the inner command's braces are
+//      still literal text at that point. Looping re-examines already
+//      -converted text on the next pass, once the inner command has
+//      become brace-free HTML — resolving nesting one layer per pass
+//      regardless of depth.
+//
+// Between the two phases, bare `&`, `<`, `>` that were NOT consumed by
+// SYMBOLIC (i.e. not part of <=, >=, or != — so real inequalities like
+// `f(x) < g(x)` and literal `&` like `a & b`) are HTML-escaped. This must
+// happen after SYMBOLIC (so intentional operators are already gone) and
+// before STRUCTURAL (so the compiler's own generated tags and the
+// &radic; entity are never escaped). There is no downstream sanitizer:
+// this output goes straight into innerHTML and into the PDF pipeline, so
+// escaping has to happen here or a bare `<` silently eats the rest of the
+// line (the browser reads `<g` as a tag open).
+//
+// CONTRACT: exponents bind exactly one character unless braced, matching
+// LaTeX convention. `x^10` compiles to `x<sup>1</sup>0`, NOT
+// `x<sup>10</sup>` — the `0` is left as plain text after the sup. Always
+// brace multi-digit (or multi-token) exponents: `x^{10}`, never `x^10`.
+// See test/math.test.mjs for a pinned example.
 
-  const SYMBOLIC = [
-    [/\\text\{([^{}]*)\}/g, "$1"],
-    CMD("left", ""), CMD("right", ""),
-    CMD("neq", "≠"), CMD("leq", "≤"), CMD("geq", "≥"),
-    CMD("ne", "≠"), CMD("le", "≤"), CMD("ge", "≥"),
-    CMD("times", "×"), CMD("cdot", "·"), CMD("div", "÷"),
-    CMD("pm", "±"), CMD("approx", "≈"), CMD("to", "→"),
-    CMD("pi", "π"), CMD("gcd", "gcd"),
-    CMD("infty", "∞"), CMD("dots", "…"), CMD("ldots", "…"),
-    CMD("ell", "ℓ"),
-    [/\+-/g, "±"], [/<=/g, "≤"], [/>=/g, "≥"], [/!=/g, "≠"],
-    [/-/g, "−"],
-  ];
+// LaTeX command aliases. Content authors reach for LaTeX spelling by
+// reflex, and expecting a dozen parallel authors to each remember a house
+// exception does not work: ~430 occurrences of \cdot, \times, \le, \pm,
+// \ge, \text, \neq, \left, \right, \pi, \to, \gcd, \div and \approx had
+// already shipped, every one rendering as literal command text. An
+// order-of-operations diagnostic question read "2 + 3 \times 4²" on the
+// page. The compiler accepts the spellings instead.
+//
+// Longer commands MUST precede their own prefixes (\neq before \ne, \leq
+// before \le), and every alias uses a (?![a-zA-Z]) guard so \le cannot
+// eat the "le" in \left. test/math.test.mjs asserts that NO backslash
+// command survives compilation anywhere in content/ -- that test is the
+// real guard against the next missing alias.
+const CMD = (name, to) => [new RegExp(`\\\\${name}(?![a-zA-Z])`, "g"), to];
 
-  const STRUCTURAL = [
-    [/\\frac\{([^{}]*)\}\{([^{}]*)\}/g,
-     '<span class="frac"><span class="fnum">$1</span><span class="fden">$2</span></span>'],
-    [/\\sqrt\[([^\[\]]*)\]\{([^{}]*)\}/g,
-     '<span class="radx"><sup class="radi">$1</sup>&radic;<span class="radb">$2</span></span>'],
-    [/\\sqrt\{([^{}]*)\}/g,
-     '<span class="radx">&radic;<span class="radb">$1</span></span>'],
-    [/\^(\{[^{}]*\}|\w)/g, (_, g) => `<sup>${g.replace(/[{}]/g, "")}</sup>`],
-  ];
+const SYMBOLIC = [
+  [/\\text\{([^{}]*)\}/g, "$1"],     // \text{...} → its contents, upright
+  CMD("left", ""), CMD("right", ""), // delimiter sizing: we render plain parens
+  CMD("neq", "≠"), CMD("leq", "≤"), CMD("geq", "≥"),
+  CMD("ne", "≠"), CMD("le", "≤"), CMD("ge", "≥"),
+  CMD("times", "×"), CMD("cdot", "·"), CMD("div", "÷"),
+  CMD("pm", "±"), CMD("approx", "≈"), CMD("to", "→"),
+  CMD("pi", "π"), CMD("gcd", "gcd"),
+  CMD("infty", "∞"), CMD("dots", "…"), CMD("ldots", "…"),
+  CMD("ell", "ℓ"),
+  [/\+-/g, "±"], [/<=/g, "≤"], [/>=/g, "≥"], [/!=/g, "≠"],
+  [/-/g, "−"],                       // ASCII hyphen → true minus, math only
+];
 
-  function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const STRUCTURAL = [
+  [/\\frac\{([^{}]*)\}\{([^{}]*)\}/g,
+   '<span class="frac"><span class="fnum">$1</span><span class="fden">$2</span></span>'],
+  // Indexed radical, e.g. \sqrt[3]{8} → ∛8. Must precede the plain \sqrt rule
+  // for clarity (it cannot actually be shadowed by it — \sqrt\{ does not match
+  // \sqrt[ — but leaving the order to chance invites a later reordering bug).
+  // Day 2 teaches rational exponents, where cube roots are unavoidable.
+  [/\\sqrt\[([^\[\]]*)\]\{([^{}]*)\}/g,
+   '<span class="radx"><sup class="radi">$1</sup>&radic;<span class="radb">$2</span></span>'],
+  [/\\sqrt\{([^{}]*)\}/g,
+   '<span class="radx">&radic;<span class="radb">$1</span></span>'],
+  [/\^(\{[^{}]*\}|\w)/g, (_, g) => `<sup>${g.replace(/[{}]/g, "")}</sup>`],
+];
+
+// & must be escaped first, or the &lt; / &gt; this step inserts would
+// themselves get escaped into &amp;lt; / &amp;gt; on the next replace.
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function compile(src) {
+  let s = src;
+  for (const [re, to] of SYMBOLIC) s = s.replace(re, to);
+  s = escapeHtml(s);
+  let prev;
+  do {
+    prev = s;
+    for (const [re, to] of STRUCTURAL) s = s.replace(re, to);
+  } while (s !== prev);
+  return s;
+}
+
+// `$` is the math delimiter, so a literal dollar sign needs an escape: `\$`.
+// Without one, money word problems -- which Algebra 1 is full of -- cannot be
+// written at all. "at most $\$100$: $40 + 15h \le 100$" was parsing into
+// three mismatched spans and printing garbage.
+//
+// Swap escaped dollars for a sentinel BEFORE delimiter matching so they can
+// never be read as a delimiter, then swap back after. U+0000 cannot occur in
+// authored content.
+const DOLLAR_SENTINEL = " ";
+
+// Markdown emphasis. Every one of the 22 days writes **bold** and *italic* —
+// 149 spans — and none of it compiled, so the printed packets carried literal
+// asterisks. "**Stop early. Sleep.**", the most important sentence in the
+// curriculum, reached the page with the asterisks on it.
+//
+// This runs on the ASSEMBLED output, not per prose segment, because emphasis
+// routinely wraps math: "**product is $c$ and sum is $b$**" puts the opening
+// ** in one segment and the closing ** in another, which a per-segment pass
+// can never match. Running it last is safe because compile() never emits a
+// literal `*` — \times becomes ×, \cdot becomes ·.
+//
+// Bold runs before italic, or `**x**` parses as two italic markers.
+function emphasis(t) {
+  return t
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+}
+
+/** Compile a string containing $...$ math spans, and HTML-escape the prose
+ *  around them. Safe for every content field. Write a literal dollar sign as
+ *  `\$`, inside math or out. */
+function math(src) {
+  const s = String(src).replace(/\\\$/g, DOLLAR_SENTINEL);
+  const re = /\$([^$]+)\$/g;
+  let out = "", last = 0, m;
+  while ((m = re.exec(s)) !== null) {
+    // Prose BETWEEN math spans is HTML-escaped, not compiled. Without this
+    // the caller has to choose: esc() the field and authored $math$ prints
+    // raw, or math() it and a bare `<` in prose eats the rest of the line.
+    // Fields like `objectives` and `parentNotes` were esc()'d for that
+    // reason and printed "Factor $ax^2+bx+c$ when $a \ne 1$" literally onto
+    // the page. Handling both here means every caller is simply correct.
+    out += escapeHtml(s.slice(last, m.index));
+    out += `<span class="math">${compile(m[1])}</span>`;
+    last = re.lastIndex;
   }
+  out += escapeHtml(s.slice(last));
+  return emphasis(out).split(DOLLAR_SENTINEL).join("$");
+}
 
-  function compile(src) {
-    let s = src;
-    for (const [re, to] of SYMBOLIC) s = s.replace(re, to);
-    s = escapeHtml(s);
-    let prev;
-    do {
-      prev = s;
-      for (const [re, to] of STRUCTURAL) s = s.replace(re, to);
-    } while (s !== prev);
-    return s;
-  }
+/** Compile without wrapping — for building math inside other math. */
+const raw = compile;
 
-  const DOLLAR_SENTINEL = "\u0000";
-
-  /** Compile a string containing $...$ math spans, HTML-escaping the prose around them. */
-  function math(src) {
-    const s = String(src).replace(/\\\$/g, DOLLAR_SENTINEL);
-    const re = /\$([^$]+)\$/g;
-    let out = "", last = 0, m;
-    while ((m = re.exec(s)) !== null) {
-      out += escapeHtml(s.slice(last, m.index));
-      out += `<span class="math">${compile(m[1])}</span>`;
-      last = re.lastIndex;
-    }
-    out += escapeHtml(s.slice(last));
-    return out.split(DOLLAR_SENTINEL).join("$");
-  }
+  // MATH_INLINE_END
 
   // Plain-text escaper for title/objectives/parentNotes — same rule as
   // build/render.mjs's esc(): never run through math().
